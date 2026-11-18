@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Promo incrementality</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@1.12.0/build/stlite.css">
+  <style>
+    body { margin: 0; background: #fcfcfb; }
+    #note { font: 15px/1.5 system-ui, sans-serif; color: #555; text-align: center;
+             padding: 40vh 16px 0; }
+  </style>
+</head>
+<body>
+  <div id="root"><p id="note">Loading the app. The first visit takes up to a minute while
+  Python downloads into your browser. Data you upload stays on your computer.</p></div>
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@1.12.0/build/stlite.js";
+    mount({
+      requirements: ["numpy", "pandas", "plotly", "pyyaml", "scipy", "statsmodels"],
+      entrypoint: "app.py",
+      files: {
+        "app.py": {
+                "url": "./app.py"
+        },
+        "promo_incrementality/__init__.py": {
+                "url": "./promo_incrementality/__init__.py"
+        },
+        "promo_incrementality/analysis.py": {
+                "url": "./promo_incrementality/analysis.py"
+        },
+        "promo_incrementality/charts.py": {
+                "url": "./promo_incrementality/charts.py"
+        },
+        "promo_incrementality/estimators.py": {
+                "url": "./promo_incrementality/estimators.py"
+        },
+        "promo_incrementality/formatting.py": {
+                "url": "./promo_incrementality/formatting.py"
+        },
+        "promo_incrementality/intake.py": {
+                "url": "./promo_incrementality/intake.py"
+        },
+        "promo_incrementality/load_starbucks.py": {
+                "url": "./promo_incrementality/load_starbucks.py"
+        },
+        "promo_incrementality/montecarlo.py": {
+                "url": "./promo_incrementality/montecarlo.py"
+        },
+        "promo_incrementality/power.py": {
+                "url": "./promo_incrementality/power.py"
+        },
+        "promo_incrementality/schema.py": {
+                "url": "./promo_incrementality/schema.py"
+        },
+        "promo_incrementality/synth.py": {
+                "url": "./promo_incrementality/synth.py"
+        },
+        "promo_incrementality/validation.py": {
+                "url": "./promo_incrementality/validation.py"
+        },
+        "examples/promo_config.yaml": {
+                "url": "./examples/promo_config.yaml"
+        },
+        "examples/sample_transactions.csv": {
+                "url": "./examples/sample_transactions.csv"
+        }
+},
+      streamlitConfig: {"theme.base": "light", "theme.primaryColor": "#2a78d6", "theme.backgroundColor": "#fcfcfb", "theme.secondaryBackgroundColor": "#f3f2ee", "theme.textColor": "#0b0b0b", "client.toolbarMode": "minimal"},
+    }, document.getElementById("root"));
+  </script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+promo_start: 2024-06-17
+promo_end: 2024-07-14
+post_window_weeks: 6
+avg_margin_per_order: 6.0
+promo_codes:
+- SUMMER
+treated_markets:
+- M1
+- M3
+markets:
+  M1:
+  - L01
+  - L02
+  - L03
+  - L04
+  - L05
+  M2:
+  - L06
+  - L07
+  - L08
+  - L09
+  - L10
+  M3:
+  - L11
+  - L12
+  - L13
+  - L14
+  M4:
+  - L15
+  - L16
+  - L17
+  M5:
+  - L18
+  - L19
+  - L20
+columns:
+  guest_id: customer_id
+  location_id: store_id
+  timestamp: order_time
+  order_total: subtotal
+  discount_amount: discount
+  promo_code: coupon
+  channel: order_type
