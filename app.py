@@ -228,7 +228,89 @@ def show_headline(text: str):
     )
 
 
-def show_simulation(worlds):
+def nearest_ten(value: float) -> str:
+    return f"{round(value, -1):,.0f}"
+
+
+def whole_percent(share: float) -> str:
+    """A whole percentage, with "<1%" so a small nonzero change doesn't read as 0%."""
+    return "<1%" if 0 < share < 0.005 else f"{share:.0%}"
+
+
+def break_even_levers(net, redemptions, subsidized, discount, margin) -> dict:
+    """What, changed alone, would bring the promo's profit to zero.
+
+    Profit = net visits × margin − redemptions × discount. Each lever solves that for
+    zero, holding everything else fixed. Negative changes mean there is a cushion.
+    """
+    paid_visits = max(net, 0) * margin
+    return {
+        "profit": net * margin - redemptions * discount,
+        "discount": paid_visits / redemptions if redemptions > 0 else np.nan,
+        # Fewer subsidized redemptions means fewer redemptions, incremental visits held fixed
+        "subsidized_change": paid_visits / discount - redemptions,
+        "subsidized": subsidized,
+        "visit_change": redemptions * discount / margin - net,
+        "net": net,
+    }
+
+
+def show_break_even(runs: pd.DataFrame, discount: float, margin: float):
+    """Three levers that would each alone take the average true profit to zero."""
+    levers = break_even_levers(runs["true_net"].mean(), runs["redemptions"].mean(),
+                               runs["true_subsidized"].mean(), discount, margin)
+    profit, net, subsidized = levers["profit"], levers["net"], levers["subsidized"]
+    change, more = levers["subsidized_change"], levers["visit_change"]
+    st.markdown("#### What would make this promo break even?")
+    # Within a cent of the break-even discount, "cut $1.75 to $1.75" would read oddly
+    close = round(levers["discount"], 2) == round(discount, 2)
+    if close:
+        text = (f"With the true effects, the promo about breaks even (it "
+                f"{'loses' if profit < 0 else 'makes'} {money_text(abs(profit))} on average), "
+                "so small changes tip it either way.")
+    elif profit < 0:
+        text = (f"With the true effects, the promo loses about {money_text(-profit)} on "
+                "average. Any one of these changes alone would bring it to break even.")
+    else:
+        text = (f"With the true effects, the promo makes about {money_text(profit)} on "
+                "average. Here is how much room it has before losing money.")
+    st.markdown(no_math(text))
+    tiles = st.columns(3)
+    if profit < 0:
+        tiles[0].metric("Break-even discount", dollars_text(levers["discount"]))
+        tiles[0].caption(no_math(
+            "No discount pays off: the promo adds no net visits." if net <= 0
+            else "The discount is already at break even." if close
+            else f"Cut the discount from {dollars_text(discount)} to "
+                 f"{dollars_text(levers['discount'])}."))
+        cut = -change
+        if subsidized > 0 and cut <= subsidized:
+            tiles[1].metric("Fewer subsidized redemptions", whole_percent(cut / subsidized))
+            tiles[1].caption(f"Target offers away from regulars: {whole_percent(cut / subsidized)} fewer "
+                             f"subsidized redemptions (about {nearest_ten(cut)} fewer).")
+        else:
+            tiles[1].metric("Fewer subsidized redemptions", "Not enough")
+            tiles[1].caption("Even with no subsidized redemptions, the incremental visits "
+                             "wouldn't cover the discounts.")
+        tiles[2].metric("Extra visits needed", f"+{nearest_ten(more)}")
+        tiles[2].caption(f"Or the promo needs {nearest_ten(more)} more net incremental visits"
+                         + (f" (+{whole_percent(more / net)})." if net > 0 else "."))
+    else:
+        tiles[0].metric("Break-even discount", dollars_text(levers["discount"]))
+        tiles[0].caption(no_math(
+            "The discount is already at break even." if close
+            else f"The discount could rise from {dollars_text(discount)} to "
+                 f"{dollars_text(levers['discount'])} before losing money."))
+        room = whole_percent(change / subsidized) if subsidized > 0 else nearest_ten(change)
+        tiles[1].metric("Room for more subsidized", f"+{room}")
+        tiles[1].caption(f"Subsidized redemptions could rise {room} (about {nearest_ten(change)} "
+                         "more) before losing money.")
+        tiles[2].metric("Room for fewer visits", f"-{nearest_ten(-more)}")
+        tiles[2].caption(f"Net incremental visits could fall by {nearest_ten(-more)}"
+                         + (f" (-{whole_percent(-more / net)})" if net > 0 else "") + " before losing money.")
+
+
+def show_simulation(worlds, discount: float, margin: float):
     runs = worlds.runs
     net_low, net_high = middle_95(runs["did_net"])
     cost_per_visit = average(runs, "cost_per_visit")
@@ -255,6 +337,7 @@ def show_simulation(worlds):
         f"{(runs['true_profit'] > 0).mean():.0%}",
         help="Share of simulated promos whose true profit was above zero.",
     )
+    show_break_even(runs, discount, margin)
 
     st.markdown("#### Did it find the planted truth?")
     st.caption(
@@ -854,7 +937,7 @@ def main():
             settings = (*effects, start_week, int(promo_weeks))
 
     if simulated:
-        show_simulation(simulate(st.session_state.first_seed, *settings))
+        show_simulation(simulate(st.session_state.first_seed, *settings), *effects[:2])
     elif shown == "Import data":
         show_import()
     else:
