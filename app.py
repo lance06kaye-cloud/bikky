@@ -2,6 +2,7 @@
 
 import html
 import io
+import json
 import secrets
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from promo_incrementality.analysis import analyze
+from promo_incrementality.calibrate import MAX_GUESTS, calibrate
 from promo_incrementality.charts import (
     chance_above,
     density_chart,
@@ -20,10 +22,11 @@ from promo_incrementality.charts import (
     weekly_means_chart,
 )
 from promo_incrementality.estimators import interval
-from promo_incrementality.formatting import dollars_text, money_text, visits_text
+from promo_incrementality.formatting import dollars_text, money_text, visit_cost_text, visits_text
 from promo_incrementality.intake import (
     MIN_PRE_WEEKS,
     DataError,
+    check_settings,
     load_transactions,
     read_config,
     read_upload,
@@ -32,6 +35,7 @@ from promo_incrementality.intake import (
 from promo_incrementality.load_starbucks import load_starbucks, wave_comparison
 from promo_incrementality.montecarlo import IN_BROWSER, run_worlds
 from promo_incrementality.synth import SynthConfig
+from promo_incrementality.theme import FAINT_TEXT, css
 
 # The browser runs one simulated promo at a time, so it runs fewer
 N_WORLDS = 25 if IN_BROWSER else 100
@@ -54,33 +58,71 @@ def show_chart(figure, name: str, **options):
 # Cached work
 
 
+# The discount the lifts are typed for. Discount elasticity scales lifts relative to it.
+REFERENCE_DISCOUNT = 1.75
+
+
+def discount_scale(discount: float, elasticity: float, reference: float) -> float:
+    """How much the lifts grow with the discount: (discount / reference) ^ elasticity.
+
+    Elasticity 0 leaves the lifts as typed, whatever the discount.
+    """
+    return (discount / reference) ** elasticity if elasticity else 1.0
+
+
 def planted_effects(
-    discount, margin, occasional_lift, lapsed_lift, subsidized_share, start_week=24, promo_weeks=4
+    discount, margin, occasional_lift, lapsed_lift, new_lift, elasticity, subsidized_share,
+    n_guests=SynthConfig().n_guests, start_week=24, promo_weeks=4, reference=REFERENCE_DISCOUNT,
 ) -> dict:
+    scale = discount_scale(discount, elasticity, reference)
     return {
         "promo_start_week": start_week,
         "promo_weeks": promo_weeks,
         "discount_amount": discount,
         "avg_margin_per_order": margin,
+        # Regulars have no lift; every other segment has its own sidebar input
         "lift_by_segment": {
             **SynthConfig().lift_by_segment,
-            "occasional": occasional_lift,
-            "lapsed": lapsed_lift,
+            "occasional": occasional_lift * scale,
+            "lapsed": lapsed_lift * scale,
+            "new": new_lift * scale,
         },
         "subsidized_share": subsidized_share,
+        "n_guests": int(n_guests),
     }
 
 
 # Cached as a shared resource, not copied on every rerun. The result is never changed.
 @st.cache_resource(show_spinner=f"Simulating {N_WORLDS} promos...", max_entries=8)
-def simulate(first_seed, *settings):
-    return run_worlds(N_WORLDS, first_seed, analyze_first=True, **planted_effects(*settings))
+def simulate(first_seed, learned: str, *settings):
+    """`learned` is SynthConfig overrides learned from an upload, as JSON ("{}" for none).
+
+    JSON keeps the cache key hashable. The sidebar's planted effects win over it.
+    """
+    # The seed comes from first_seed, and the timeline is fitted to a 52-week year
+    overrides = {key: tuple(value) if isinstance(value, list) else value
+                 for key, value in json.loads(learned).items()
+                 if key not in ("seed", "n_weeks")}
+    return run_worlds(N_WORLDS, first_seed, analyze_first=True,
+                      **{**overrides, **planted_effects(*settings)})
+
+
+def as_json(overrides: dict) -> str:
+    """Overrides as sorted JSON, with numpy numbers turned into plain ones."""
+    return json.dumps(overrides, sort_keys=True,
+                      default=lambda value: value.item() if hasattr(value, "item") else list(value))
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
 def analyze_upload(csv_bytes: bytes, *settings):
     """Analyze the one-file upload. `settings` are read_upload's promo settings."""
     return analyze(*read_upload(io.BytesIO(csv_bytes), *settings))
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def calibrate_upload(csv_bytes: bytes, *settings):
+    """What the upload says about the business, for simulating it. `settings` as above."""
+    return calibrate(*read_upload(io.BytesIO(csv_bytes), *settings))
 
 
 @st.cache_resource(show_spinner="Preparing the example file...")
@@ -111,18 +153,19 @@ def run_starbucks():
 
 
 # Label, truth column, estimate column, and how to format the numbers
-NAIVE_LABEL = "Naive before/after estimate of lift during the promo"
 METRICS = [
     ("Net incremental visits", "true_net", "did_net", visits_text),
     ("Lift during the promo", "true_promo", "did_promo", visits_text),
-    (NAIVE_LABEL, "true_promo", "pre_post", visits_text),
     ("After the promo (halo minus pull-forward)", "true_post", "did_post", visits_text),
     ("Subsidized redemptions", "true_subsidized", "subsidized", visits_text),
-    ("Cost per net incremental visit", "true_cost_per_visit", "cost_per_visit", dollars_text),
+    ("Cost per net incremental visit", "true_cost_per_visit", "cost_per_visit", visit_cost_text),
     ("Net profit", "true_profit", "net_profit", money_text),
 ]
+# Every number on the simulated view is either planted (true) or estimated, and says which
+TRUE_COLUMN, ESTIMATE_COLUMN = "True (planted)", "Estimated"
+TRUE_MARKER = "True (planted) average"
 # The same rounding as each formatter above, for chart axes and hover (d3 formats)
-CHART_FORMATS = {visits_text: ",.0f", dollars_text: "$,.2f", money_text: "$,.0f"}
+CHART_FORMATS = {visits_text: ",.0f", visit_cost_text: "$,.2f", money_text: "$,.0f"}
 
 
 def average(runs: pd.DataFrame, column: str) -> float:
@@ -137,16 +180,35 @@ def average(runs: pd.DataFrame, column: str) -> float:
     return runs[column].mean()
 
 
+def not_meaningful(runs: pd.DataFrame) -> int:
+    """Runs whose estimated net visits are zero or below, so cost per visit means nothing."""
+    return int((runs["did_net"] <= 0).sum())
+
+
 def metrics_table(runs: pd.DataFrame) -> pd.DataFrame:
+    """True (planted) average, estimated average and middle 95% for each METRICS row.
+
+    Cost per visit's range leaves out runs with no estimated net visits: a cost
+    divided by zero or fewer visits is undefined, not a large number.
+    """
     rows = []
     for label, truth, estimate, text in METRICS:
-        low, high = middle_95(runs[estimate])
+        values = runs[estimate]
+        spread = "n/a"
+        if estimate == "cost_per_visit":
+            values = values[runs["did_net"] > 0]
+            spread = "No run had net visits"
+        if values.notna().any():
+            low, high = middle_95(values)
+            spread = f"{text(low)} to {text(high)}"
+        if estimate == "cost_per_visit" and not_meaningful(runs):
+            spread += f" ({not_meaningful(runs)} runs left out)"
         rows.append(
             {
                 "Average per promo": label,
-                "Truth": text(average(runs, truth)),
-                "Estimate": text(average(runs, estimate)),
-                "Middle 95% of runs": f"{text(low)} to {text(high)}",
+                TRUE_COLUMN: text(average(runs, truth)),
+                ESTIMATE_COLUMN: text(average(runs, estimate)),
+                "Middle 95% of runs": spread,
             }
         )
     return pd.DataFrame(rows)
@@ -158,7 +220,7 @@ def metric_distribution_chart(runs: pd.DataFrame, row: int):
     Raises ValueError when the runs don't vary enough to draw a curve.
     """
     label, truth, estimate, text = METRICS[row]
-    markers = [(average(runs, truth), "True average")]
+    markers = [(average(runs, truth), TRUE_MARKER)]
     if estimate == "did_net":
         markers.append((runs["break_even_visits"].mean(), "Break-even"))
     elif estimate == "net_profit":
@@ -166,7 +228,7 @@ def metric_distribution_chart(runs: pd.DataFrame, row: int):
     elif estimate == "cost_per_visit":
         markers.append((runs["cost_per_redemption"].mean(), "Face value"))
     x, density = density_from_samples(runs[estimate])
-    title = f"{label}: distribution across {len(runs)} simulated promos"
+    title = f"{label}: estimates across {len(runs)} simulated promos"
     return density_chart(x, density, title, label, markers, CHART_FORMATS[text])
 
 
@@ -216,25 +278,36 @@ def estimated_week(coefficients: pd.DataFrame):
     return draw
 
 
-def show_headline(text: str):
-    """A headline styled like a heading, but a paragraph.
+def show_headline(key: str, detail: str):
+    """A headline styled like a heading, but paragraphs: the key result large, then
+    the sentence behind it.
 
     Streamlit gives every heading an id built from its text, even with anchor=False,
     so a heading with numbers would leave stale numbers in a copied link.
     """
-    st.html(
-        '<p style="font-size: 1.5rem; font-weight: 600; line-height: 1.35; '
-        f'margin: 0.25rem 0 1rem">{html.escape(text)}</p>'
-    )
+    st.html(f'<p class="headline-key">{html.escape(key)}</p>'
+            f'<p class="headline-detail">{html.escape(detail)}</p>')
 
 
 def nearest_ten(value: float) -> str:
-    return f"{round(value, -1):,.0f}"
+    """Visits to the nearest 10, rounded before formatting so it never reads "-0"."""
+    return f"{round(value, -1) + 0.0:,.0f}"
+
+
+def signed_ten(value: float) -> str:
+    """Visits to the nearest 10 with a sign, e.g. +230 or -870, and plain 0 for zero."""
+    rounded = round(value, -1)
+    return "0" if rounded == 0 else f"{rounded:+,.0f}"
 
 
 def whole_percent(share: float) -> str:
     """A whole percentage, with "<1%" so a small nonzero change doesn't read as 0%."""
     return "<1%" if 0 < share < 0.005 else f"{share:.0%}"
+
+
+def share_of(change: float, base: float) -> str | None:
+    """The change as a whole percentage of base, or None when base is zero or less."""
+    return whole_percent(abs(change) / base) if base > 0 else None
 
 
 def break_even_levers(net, redemptions, subsidized, discount, margin) -> dict:
@@ -255,67 +328,142 @@ def break_even_levers(net, redemptions, subsidized, discount, margin) -> dict:
     }
 
 
+# Within this share of discount spend, the promo counts as already at break even
+BREAK_EVEN_BAND = 0.05
+AT_BREAK_EVEN = "This promo is already at about break-even."
+
+
+def about_break_even(levers: dict, redemptions: float, discount: float) -> bool:
+    """True when profit is within BREAK_EVEN_BAND of the discount spend, or the break-even
+    discount rounds to the current one, so the levers would show trivial changes."""
+    near = abs(levers["profit"]) < BREAK_EVEN_BAND * redemptions * discount
+    return near or round(levers["discount"], 2) == round(discount, 2)
+
+
+def no_visits_break_even(runs: pd.DataFrame, discount: float, margin: float) -> str | None:
+    """The break-even sentence when the planted promo adds no net visits, else None.
+
+    Then no discount and no cut in subsidized redemptions can pay off, so the three
+    levers would contradict "any one of these changes alone". It reads the true
+    effect, like the levers, and counts net visits that round to 0 as none.
+    """
+    redemptions = runs["redemptions"].mean()
+    if round(runs["true_net"].mean(), -1) > 0 or not redemptions > 0:
+        return None
+    needed = break_even_levers(0, redemptions, 0, discount, margin)["visit_change"]
+    return ("With no extra visits, every redemption is a subsidy, so no discount level "
+            f"breaks even. The promo would need about {nearest_ten(needed)} net incremental "
+            "visits to pay for itself.")
+
+
 def show_break_even(runs: pd.DataFrame, discount: float, margin: float):
-    """Three levers that would each alone take the average true profit to zero."""
+    """Three levers that would each alone take the average true profit to zero.
+
+    Near break even the levers would read like "cut $1.75 to $1.74", so one line
+    replaces them. Any percentage is left out when its base is zero, and counts are
+    rounded before their sign is chosen, so the text never divides by zero or shows "-0".
+    """
+    if (text := no_visits_break_even(runs, discount, margin)) is not None:
+        st.markdown("#### What would make this promo break even?")
+        st.markdown(no_math(text))
+        return
     levers = break_even_levers(runs["true_net"].mean(), runs["redemptions"].mean(),
                                runs["true_subsidized"].mean(), discount, margin)
     profit, net, subsidized = levers["profit"], levers["net"], levers["subsidized"]
     change, more = levers["subsidized_change"], levers["visit_change"]
     st.markdown("#### What would make this promo break even?")
-    # Within a cent of the break-even discount, "cut $1.75 to $1.75" would read oddly
-    close = round(levers["discount"], 2) == round(discount, 2)
-    if close:
-        text = (f"With the true effects, the promo about breaks even (it "
-                f"{'loses' if profit < 0 else 'makes'} {money_text(abs(profit))} on average), "
-                "so small changes tip it either way.")
-    elif profit < 0:
-        text = (f"With the true effects, the promo loses about {money_text(-profit)} on "
+    if about_break_even(levers, runs["redemptions"].mean(), discount):
+        st.markdown(no_math(f"With the true (planted) effects, the promo "
+                            f"{'loses' if profit < 0 else 'makes'} about "
+                            f"{money_text(abs(profit))} on average. {AT_BREAK_EVEN}"))
+        return
+    if profit < 0:
+        text = (f"With the true (planted) effects, the promo loses about {money_text(-profit)} on "
                 "average. Any one of these changes alone would bring it to break even.")
     else:
-        text = (f"With the true effects, the promo makes about {money_text(profit)} on "
+        text = (f"With the true (planted) effects, the promo makes about {money_text(profit)} on "
                 "average. Here is how much room it has before losing money.")
     st.markdown(no_math(text))
     tiles = st.columns(3)
+
+    tiles[0].metric("Break-even discount", dollars_text(levers["discount"]))
+    if np.isnan(levers["discount"]):
+        tiles[0].caption("No redemptions, so the discount costs nothing.")
+    elif net <= 0:
+        tiles[0].caption("No discount pays off: the promo adds no net visits.")
+    elif profit < 0:
+        tiles[0].caption(no_math(f"Cut the discount from {dollars_text(discount)} to "
+                                 f"{dollars_text(levers['discount'])}."))
+    else:
+        tiles[0].caption(no_math(f"The discount could rise from {dollars_text(discount)} to "
+                                 f"{dollars_text(levers['discount'])} before losing money."))
+
+    percent = share_of(change, subsidized)
     if profit < 0:
-        tiles[0].metric("Break-even discount", dollars_text(levers["discount"]))
-        tiles[0].caption(no_math(
-            "No discount pays off: the promo adds no net visits." if net <= 0
-            else "The discount is already at break even." if close
-            else f"Cut the discount from {dollars_text(discount)} to "
-                 f"{dollars_text(levers['discount'])}."))
-        cut = -change
-        if subsidized > 0 and cut <= subsidized:
-            tiles[1].metric("Fewer subsidized redemptions", whole_percent(cut / subsidized))
-            tiles[1].caption(f"Target offers away from regulars: {whole_percent(cut / subsidized)} fewer "
-                             f"subsidized redemptions (about {nearest_ten(cut)} fewer).")
+        if subsidized > 0 and -change <= subsidized:
+            tiles[1].metric("Fewer subsidized redemptions", percent)
+            tiles[1].caption(f"Target offers away from regulars: {percent} fewer subsidized "
+                             f"redemptions (about {nearest_ten(-change)} fewer).")
         else:
             tiles[1].metric("Fewer subsidized redemptions", "Not enough")
             tiles[1].caption("Even with no subsidized redemptions, the incremental visits "
                              "wouldn't cover the discounts.")
-        tiles[2].metric("Extra visits needed", f"+{nearest_ten(more)}")
-        tiles[2].caption(f"Or the promo needs {nearest_ten(more)} more net incremental visits"
-                         + (f" (+{whole_percent(more / net)})." if net > 0 else "."))
     else:
-        tiles[0].metric("Break-even discount", dollars_text(levers["discount"]))
-        tiles[0].caption(no_math(
-            "The discount is already at break even." if close
-            else f"The discount could rise from {dollars_text(discount)} to "
-                 f"{dollars_text(levers['discount'])} before losing money."))
-        room = whole_percent(change / subsidized) if subsidized > 0 else nearest_ten(change)
-        tiles[1].metric("Room for more subsidized", f"+{room}")
-        tiles[1].caption(f"Subsidized redemptions could rise {room} (about {nearest_ten(change)} "
-                         "more) before losing money.")
-        tiles[2].metric("Room for fewer visits", f"-{nearest_ten(-more)}")
+        # A percentage of zero subsidized redemptions is undefined, so show only the count
+        tiles[1].metric("Room for more subsidized",
+                        f"+{percent}" if percent else signed_ten(change))
+        tiles[1].caption(f"Subsidized redemptions could rise "
+                         + (f"{percent} (about {nearest_ten(change)} more)" if percent
+                            else f"by about {nearest_ten(change)}")
+                         + " before losing money.")
+
+    percent = share_of(more, net)
+    if profit < 0:
+        tiles[2].metric("Extra visits needed", signed_ten(more))
+        tiles[2].caption(f"Or the promo needs {nearest_ten(more)} more net incremental visits"
+                         + (f" ({percent} more)." if percent else "."))
+    else:
+        tiles[2].metric("Room for fewer visits", signed_ten(more))
         tiles[2].caption(f"Net incremental visits could fall by {nearest_ten(-more)}"
-                         + (f" (-{whole_percent(-more / net)})" if net > 0 else "") + " before losing money.")
+                         + (f" (-{percent})" if percent and round(more, -1) else "")
+                         + " before losing money.")
+
+
+PLANTED_NOTE = ("The simulation plants a known true effect, then estimates it from noisy data "
+                "the way a real test would. Estimated numbers are those noisy attempts; true "
+                "numbers come from the planted effect, so the two can differ.")
+
+
+def show_no_visits_headline(runs: pd.DataFrame, net_low: float, net_high: float):
+    """The headline when the estimated net visits average zero or below.
+
+    There is no cost per visit to state, and "About -56 net incremental visits, at
+    n/a each" read as a broken page. Counts are rounded before formatting so they
+    never read "-0".
+    """
+    def count(value):
+        return f"{round(value) + 0.0:,.0f}"
+
+    show_headline(
+        "This promo added no measurable visits",
+        f"Across {len(runs)} simulated promos, net incremental visits averaged about "
+        f"{count(runs['did_net'].mean())} (most runs {count(net_low)} to {count(net_high)}), "
+        f"so the {count(runs['redemptions'].mean())} redemptions mostly went to guests who "
+        f"would have come anyway, at {dollars_text(runs['cost_per_redemption'].mean())} each.",
+    )
 
 
 def show_simulation(worlds, discount: float, margin: float):
     runs = worlds.runs
     net_low, net_high = middle_95(runs["did_net"])
     cost_per_visit = average(runs, "cost_per_visit")
-    # Same net visits as the cost below, so cost / visits matches the stated cost per visit
-    show_headline(
+    if np.isnan(cost_per_visit):
+        show_no_visits_headline(runs, net_low, net_high)
+    else:
+        # Same net visits as the cost below, so cost / visits matches the stated cost per visit
+        show_headline(
+        f"About {runs['did_net'].mean():,.0f} net incremental visits, at "
+        f"{dollars_text(cost_per_visit)} each",
         f"Across {len(runs)} simulated promos, {runs['redemptions'].mean():,.0f} redemptions "
         f"added about {runs['did_net'].mean():,.0f} net incremental visits on average "
         f"(most runs {net_low:,.0f} to {net_high:,.0f}). Each net incremental visit cost "
@@ -331,20 +479,26 @@ def show_simulation(worlds, discount: float, margin: float):
         "redemptions minus the lift during the promo. Same definition as the "
         "Subsidized redemptions row below.",
     )
-    tiles[2].metric("Average net profit", money_text(runs["net_profit"].mean()))
+    tiles[2].metric(
+        "Average estimated net profit",
+        money_text(runs["net_profit"].mean()),
+        help="The average of the estimates. Each run estimates profit from noisy data, "
+        "as a real test would, so it can miss the true (planted) profit.",
+    )
     tiles[3].metric(
-        "Chance of profit",
+        "Chance of true profit",
         f"{(runs['true_profit'] > 0).mean():.0%}",
         help="Share of simulated promos whose true profit was above zero.",
     )
+    st.caption(PLANTED_NOTE)
     show_break_even(runs, discount, margin)
 
     st.markdown("#### Did it find the planted truth?")
-    st.caption(
-        "Tick a row to see its probability distribution. The naive before/after row's "
-        "truth is the actual lift during the promo, so the row shows how far a naive "
-        "comparison with the weeks before misses it."
-    )
+    caption = "Tick a row to see its probability distribution."
+    if not_meaningful(runs):
+        caption += (f" {not_meaningful(runs)} of {len(runs)} runs estimated no net incremental "
+                    "visits, so their cost per visit isn't meaningful and is left out of its range.")
+    st.caption(caption)
     picked = st.dataframe(
         metrics_table(runs),
         hide_index=True,
@@ -357,7 +511,10 @@ def show_simulation(worlds, discount: float, margin: float):
     try:
         show_chart(metric_distribution_chart(runs, row), "sim_metric")
     except ValueError:
-        st.info("These runs don't vary enough to draw a distribution.")
+        if METRICS[row][2] == "cost_per_visit" and runs["cost_per_visit"].isna().all():
+            st.info("No run had net incremental visits, so there's no cost per visit to draw.")
+        else:
+            st.info("These runs don't vary enough to draw a distribution.")
     caption = "Each simulated promo is one draw of luck. The curve shows where results land."
     undefined = runs[METRICS[row][2]].isna().sum()
     if undefined and METRICS[row][2] == "cost_per_visit":
@@ -365,6 +522,9 @@ def show_simulation(worlds, discount: float, margin: float):
                     "visit is undefined and they aren't in the curve.")
     elif undefined:
         caption += f" {undefined} runs had no value and aren't in the curve."
+    if METRICS[row][2] == "cost_per_visit" and np.isnan(average(runs, "true_cost_per_visit")):
+        caption += (" The planted promo adds no net visits, so its true cost per visit is "
+                    "undefined and has no line.")
     st.caption(caption)
 
     show_chart(weekly_means_chart(worlds.weekly_means, worlds.promo), "sim_weekly")
@@ -416,7 +576,7 @@ def show_analysis(result, key: str, used: list | None = None):
         f"{estimate['subsidized_redemptions']:,.0f}",
         help="Redemptions minus the lift during the promo.",
     )
-    tiles[2].metric("Cost per net incremental visit", dollars_text(cost))
+    tiles[2].metric("Cost per net incremental visit", visit_cost_text(cost))
     tiles[3].metric("Net profit", money_text(estimate["net_profit"]))
     st.caption(no_math(visit_accounting(estimate)))
 
@@ -634,10 +794,16 @@ def run_analysis():
 MIN_RUN_SECONDS = 1.0
 
 
+SAMPLE_NAME = "example_orders.csv"
+DEMO_HINT = "← Click here for demo"
+SAMPLE_LOADED_HINT = "Sample loaded. Now click **Run analysis** below ↓"
+RUN_HINT = "← Click Run analysis to see the results"
+
+
 def load_sample():
     """Fill the page with the example file and its promo settings, ready to run."""
     csv_bytes, settings = example_upload()
-    st.session_state[KEPT] = ("example_orders.csv", csv_bytes)
+    st.session_state[KEPT] = (SAMPLE_NAME, csv_bytes)
     st.session_state.uploader_round = st.session_state.get("uploader_round", 0) + 1
     for key, value in settings.items():
         st.session_state[f"setting_{key}"] = value
@@ -645,7 +811,8 @@ def load_sample():
 
 
 def promo_settings() -> dict:
-    """The promo details the CSV can't hold."""
+    """The promo details the CSV can't hold. A setting that can't work is flagged
+    under its field as soon as it's entered."""
     first, last, margin, weeks = st.columns(4)
     entered = {
         "promo_start": first.date_input("Promo's first day", key="setting_promo_start",
@@ -666,14 +833,70 @@ def promo_settings() -> dict:
         "Promo codes (optional, comma separated)", key="setting_promo_codes",
         help="Only orders with these codes count as redemptions. Leave blank to count every "
              "discounted order at promo stores during the promo.")
+    columns = {"promo_end": last, "margin": margin, "post_weeks": weeks}
+    for key, problem in setting_problems(entered).items():
+        columns[key].error(problem)
     return entered
+
+
+# check_settings names fields by read_upload's arguments; the page by SETTINGS keys
+SETTING_FIELDS = {"promo_end": "promo_end", "avg_margin_per_order": "margin",
+                  "post_window_weeks": "post_weeks"}
+
+
+def setting_problems(entered: dict) -> dict:
+    """Settings that can't work, by SETTINGS key. Blank fields are left to
+    missing_inputs."""
+    found = check_settings(entered["promo_start"], entered["promo_end"],
+                           entered["margin"], entered["post_weeks"])
+    return {SETTING_FIELDS[field]: problem for field, problem in found.items()
+            if entered[SETTING_FIELDS[field]] is not None}
+
+
+def missing_inputs(has_file: bool, entered: dict) -> list:
+    """What still has to be filled in before the upload can be read, in words."""
+    blank = [label for key, label in [("promo_start", "promo's first day"),
+                                      ("promo_end", "promo's last day"),
+                                      ("margin", "profit per order")]
+             if entered[key] is None]
+    return ([] if has_file else ["a CSV"]) + [f"the {label}" for label in blank]
+
+
+def upload_settings(entered: dict) -> tuple:
+    """read_upload's promo settings, from the Import page's inputs."""
+    codes = tuple(code.strip() for code in entered["promo_codes"].split(",") if code.strip())
+    return (entered["promo_start"], entered["promo_end"], float(entered["margin"]),
+            int(entered["post_weeks"]), codes)
+
+
+SETTINGS_HEADING = "Check these settings:"
+FILE_HEADING = "This file can't be analyzed yet. Fix the following and upload it again:"
+
+
+def show_problems(error: DataError):
+    """Why the upload can't be analyzed: settings to change apart from fixes to the file."""
+    for heading, problems in [(SETTINGS_HEADING, error.setting_problems),
+                              (FILE_HEADING, error.file_problems)]:
+        if problems:
+            st.error(no_math(heading + "\n" + "\n".join(f"- {problem}" for problem in problems)))
 
 
 def show_import():
     # The sample is the obvious first step until the viewer has a file of their own
     has_file = bool(st.session_state.get(KEPT))
-    st.button("Try sample data", type="secondary" if has_file else "primary",
-              on_click=load_sample, help="Fills in an example file and its promo settings.")
+    ran = st.session_state.get("ran")
+    sample_loaded = has_file and st.session_state[KEPT][0] == SAMPLE_NAME
+    # Settings as last entered: the inputs are drawn further down
+    flagged = bool(setting_problems({key: st.session_state.get(f"setting_{key}")
+                                     for key in SETTINGS}))
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        st.button("Try sample data", type="secondary" if has_file else "primary",
+                  on_click=load_sample, help="Fills in an example file and its promo settings.")
+        # Walk a first-time visitor through the demo: load the sample, then run it
+        if not has_file:
+            st.markdown(f":blue[{DEMO_HINT}]")
+        elif sample_loaded and not ran and not flagged:
+            st.markdown(SAMPLE_LOADED_HINT)
     example_bytes, _ = example_upload()
     with st.expander("Format your CSV with AI"):
         st.caption("Paste this into ChatGPT or Claude, with a few rows of your export "
@@ -683,31 +906,40 @@ def show_import():
 
     upload = kept_upload("Orders (CSV)", "csv")
     entered = promo_settings()
-    blank = [label for key, label in [("promo_start", "promo's first day"),
-                                      ("promo_end", "promo's last day"),
-                                      ("margin", "profit per order")]
-             if entered[key] is None]
-    missing = ([] if upload else ["a CSV"]) + [f"the {label}" for label in blank]
+    missing = missing_inputs(bool(upload), entered)
     listed = ", ".join(missing[:-1]) + " and " + missing[-1] if len(missing) > 1 else "".join(missing)
-    st.button("Run analysis", type="primary", disabled=bool(missing), on_click=run_analysis,
-              help=f"Add {listed} first." if missing else None)
-    if missing or not st.session_state.get("ran"):
+    flagged = bool(setting_problems(entered))
+    blocked = bool(missing) or flagged
+    # Primary only once it can run, so the sample button is the one highlighted before
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        st.button("Run analysis", type="secondary" if blocked else "primary",
+                  disabled=blocked, on_click=run_analysis,
+                  help=f"Add {listed} first." if missing
+                  else "Fix the settings marked above first." if flagged else None)
+        if not blocked and not ran:
+            st.markdown(f":blue[{RUN_HINT}]")
+    if blocked or not st.session_state.get("ran"):
         return
     csv_bytes = upload[1]
 
-    codes = tuple(code.strip() for code in entered["promo_codes"].split(",") if code.strip())
-    started = time.monotonic()
+    # Right after a click, a status box under the button shows the run; later reruns
+    # (any widget change) reuse the cached result without it
+    just_ran = st.session_state.pop("just_ran", False)
+    status = st.status("Running the analysis...") if just_ran else None
     try:
-        with st.spinner("Running the analysis..."):
-            result = analyze_upload(csv_bytes, entered["promo_start"], entered["promo_end"],
-                                    float(entered["margin"]), int(entered["post_weeks"]), codes)
-            if st.session_state.pop("just_ran", False) and not IN_BROWSER:
-                time.sleep(max(0.0, MIN_RUN_SECONDS - (time.monotonic() - started)))
+        started = time.monotonic()
+        result = analyze_upload(csv_bytes, *upload_settings(entered))
+        if status:
+            time.sleep(max(0.0, MIN_RUN_SECONDS - (time.monotonic() - started)))
+            status.update(label="Analysis done. Results are below.", state="complete")
     except DataError as error:
-        st.error("This file can't be analyzed yet. Fix the following and upload it again:\n"
-                 + "\n".join(f"- {problem}" for problem in error.problems))
+        if status:
+            status.update(label="The analysis couldn't run", state="error")
+        show_problems(error)
         return
     except Exception as error:
+        if status:
+            status.update(label="The analysis couldn't run", state="error")
         st.error(f"Couldn't read this file ({type(error).__name__}): {error}")
         return
 
@@ -717,7 +949,6 @@ def show_import():
     with st.sidebar:
         st.subheader("Assumptions")
         st.caption(no_math("\n".join(f"- {line}" for line in used)))
-    st.divider()
     st.header("Results", anchor=False)
     show_analysis(result, "your_data", used)
 
@@ -816,10 +1047,9 @@ def show_starbucks():
     with st.expander("Totals over each window"):
         st.table(window_totals(waves[readable]), hide_index=True)
     if not readable.all():
-        st.divider()
         st.markdown(f"**Too small to read** (fewer than {MIN_CONTROLS} not-yet-sent controls)")
         small = wave_table(waves[~readable])
-        st.table(small.style.set_properties(color="#9aa0a6"), hide_index=True)
+        st.table(small.style.set_properties(color=FAINT_TEXT), hide_index=True)
 
 
 # Page
@@ -831,26 +1061,129 @@ VIEWS = ["Import data", "Simulated promo", "Starbucks offers"]
 # Key, label, lowest, highest (None for no limit), default, step, and what to divide the
 # entry by to get the value planted_effects takes. In the order planted_effects takes them.
 # Shares are typed as percentages, so 10 means 10%. Whole-number defaults make
-# whole-number inputs. The $1.75 discount makes the default promo about break even:
-# average true profit near $0.
+# whole-number inputs. The $1.75 discount (REFERENCE_DISCOUNT) puts the default promo
+# just under break even, with about a 40% chance of true profit, by request. The
+# break-even card then shows its one-line "already at about break-even" message.
 INPUTS = [
-    ("discount", "Discount per redemption ($)", 0.01, None, 1.75, 0.25, 1),
+    ("discount", "Discount per redemption ($)", 0.01, None, REFERENCE_DISCOUNT, 0.25, 1),
     ("margin", "Margin per order ($)", 0.01, None, 6.0, 0.5, 1),
     ("occasional_lift", "Visit lift: occasional guests (%)", 0.0, 1000.0, 10.0, 5.0, 100),
     ("lapsed_lift", "Visit lift: lapsed guests (%)", 0.0, 1000.0, 100.0, 25.0, 100),
+    ("new_lift", "Visit lift: new guests (%)", 0.0, 1000.0, 25.0, 5.0, 100),
+    ("elasticity", "Discount elasticity", 0.0, 5.0, 0.0, 0.25, 1),
     ("subsidized_share", "Baseline visits that redeem anyway (%)", 0.0, 100.0, 20.0, 5.0, 100),
+    ("n_guests", "Guests in the chain", 1_000, MAX_GUESTS, SynthConfig().n_guests, 5_000, 1),
     ("start_week", "Promo starts (weeks into the year)", 8, 45, 24, 1, 1),
     ("promo_weeks", "Promo length (weeks)", 1, 12, 4, 1, 1),
 ]
 PERCENT_HELP = {
     "occasional_lift": "Extra visits during the promo, as a percentage of normal: 10 means 10% more.",
     "lapsed_lift": "Extra visits during the promo, as a percentage of normal: 100 means twice as many.",
+    "new_lift": "Extra visits during the promo from guests in their first months: 25 means 25% "
+                "more. Regulars have no lift.",
+    "elasticity": "How much a bigger discount raises the lifts. Each lift is multiplied by "
+                  "(discount ÷ reference discount) ^ elasticity. The reference is \\$1.75, or "
+                  "your past promo's discount with Use my data. 0 means the discount size "
+                  "doesn't change visits; 1 means doubling the discount doubles the lifts.",
     "subsidized_share": "Percentage of ordinary promo-period visits at promo stores that use the discount.",
-    "start_week": "When the discount begins. The simulated year has seasonality peaking in "
-                  "late summer, so the start week changes how much a naive before/after "
-                  "comparison is fooled.",
+    "n_guests": "Everyone who visits at least once in the year, spread over the stores. More "
+                "guests means more redemptions and visits, and steadier estimates. With Use my "
+                f"data it starts at your file's count; the simulation runs at most {MAX_GUESTS:,}.",
+    "start_week": "When the discount begins. The simulated year is busiest in late summer.",
     "promo_weeks": "How many weeks the discount runs.",
 }
+
+
+USE_MY_DATA = "use_my_data"
+
+
+def my_data_calibration():
+    """The calibration for the Import page's file and settings, or None while they're
+    incomplete. Raises DataError if the file can't be read."""
+    upload = st.session_state.get(KEPT)
+    entered = {key: st.session_state.get(f"setting_{key}") for key in SETTINGS}
+    if missing_inputs(bool(upload), entered):
+        return None
+    return calibrate_upload(upload[1], *upload_settings(entered))
+
+
+def fill_from_my_data():
+    """When Use my data turns on, start the sliders at what the file says, once.
+
+    Later reruns leave them alone, so the viewer can edit them.
+    """
+    if not st.session_state.get(USE_MY_DATA):
+        return
+    try:
+        learned = my_data_calibration()
+    except (DataError, ValueError):
+        st.session_state[USE_MY_DATA] = False
+        st.session_state.my_data_problem = True
+        return
+    if learned is None:
+        return
+    bounds = {key: (low, high) for key, _, low, high, *_ in INPUTS}
+    for key, value in {"discount": learned.discount, "margin": learned.margin,
+                       "n_guests": learned.overrides.get("n_guests", SynthConfig().n_guests),
+                       **(learned.lifts or {})}.items():
+        low, high = bounds[key]
+        value = min(max(float(value), low), high or float("inf"))
+        st.session_state[key] = int(round(value)) if key == "n_guests" else round(value, 2)
+
+
+def my_data_toggle():
+    """The Use my data switch and what was learned. Returns the calibration in use, or None."""
+    ready = not missing_inputs(bool(st.session_state.get(KEPT)),
+                               {key: st.session_state.get(f"setting_{key}") for key in SETTINGS})
+    learned = None
+    if not ready:
+        st.session_state[USE_MY_DATA] = False
+    elif st.session_state.get(USE_MY_DATA):
+        try:
+            learned = my_data_calibration()
+        except (DataError, ValueError):
+            st.session_state[USE_MY_DATA] = False
+            st.session_state.my_data_problem = True
+    st.toggle("Use my data", key=USE_MY_DATA, disabled=not ready, on_change=fill_from_my_data,
+              help="Simulate your own stores, visits and guests, learned from your file."
+              if ready else "Upload a CSV and enter the promo details on Import data first.")
+    if st.session_state.pop("my_data_problem", False):
+        st.warning("Your file can't be read. Check it on Import data.")
+    if learned:
+        st.caption(no_math("\n".join(f"- {note}" for note in learned.notes)))
+    return learned
+
+
+def limits_text(low, high, default) -> str:
+    """The allowed range of an input, in words."""
+    show = (lambda value: f"{value:,}") if isinstance(default, int) else (lambda value: f"{value:g}")
+    return f"between {show(low)} and {show(high)}" if high is not None else f"at least {show(low)}"
+
+
+def checked_inputs() -> tuple:
+    """Draw the sidebar inputs and return (values, problems).
+
+    The inputs have no min or max of their own: Streamlit rejects an out-of-range
+    entry in the browser without telling the script, so the page kept showing old
+    results with no explanation. Each entry is checked here instead. An entry
+    outside its limits is reported, and the last valid value is used until it's fixed.
+    """
+    values, problems = [], []
+    for key, label, low, high, default, step, scale in INPUTS:
+        typed = st.number_input(label, step=step, key=key, help=PERCENT_HELP.get(key),
+                                format="%d" if isinstance(default, int)
+                                else "%.2f" if scale == 1 else "%.1f")
+        valid = typed is not None and typed >= low and (high is None or typed <= high)
+        if valid:
+            st.session_state[f"valid_{key}"] = typed
+        else:
+            kept = st.session_state.get(f"valid_{key}", default)
+            problems.append(f"{label} must be {limits_text(low, high, default)}. "
+                            f"Using {kept:g} until it's fixed.")
+        values.append((typed if valid else st.session_state.get(f"valid_{key}", default)) / scale)
+    for problem in problems:
+        st.warning(no_math(problem))
+    return values, problems
 
 
 def promo_timeline(start_week: int, promo_weeks: int) -> tuple:
@@ -886,6 +1219,7 @@ def timeline_text(start_week: int, promo_weeks: int) -> str:
 
 def main():
     st.set_page_config(page_title="Bikky demo: promo incrementality", layout="wide")
+    st.html(css())
     st.markdown("**Bikky demo**")
     st.title("Promo incrementality")
     st.markdown(
@@ -901,6 +1235,7 @@ def main():
         st.session_state[key] = st.session_state.get(key, default)
     for key, default in SETTINGS.items():
         st.session_state[f"setting_{key}"] = st.session_state.get(f"setting_{key}", default)
+    st.session_state[USE_MY_DATA] = st.session_state.get(USE_MY_DATA, False)
 
     # A switcher rather than st.tabs, so the sidebar knows which view is showing and
     # only offers the simulation controls where they do something
@@ -910,34 +1245,40 @@ def main():
 
     with st.sidebar:
         if simulated:
-            st.header("Simulated promo")
-            st.caption(f"Plant the true effects, then see whether the estimates follow. Results "
-                       f"average {N_WORLDS} simulated promos.")
+            # Filled in once the inputs below are read, so it states this run's guest count
+            intro = st.empty()
             if st.button("Resimulate", type="primary", width="stretch"):
                 st.session_state.first_seed = secrets.randbelow(1_000_000)
-        if st.button("Reset graphs", width="stretch", help="Clear zoom and selections."):
+        if st.button("Reset graphs", type="tertiary", help="Clear zoom and selections."):
             st.session_state.view += 1
         if shown == "Import data":
-            st.header("Import data")
             st.caption(
                 "1. Upload a CSV of orders.\n"
                 "2. Enter the promo details.\n"
                 "3. Run analysis."
             )
         if simulated:
-            entered = [
-                st.number_input(label, low, high, step=step, key=key, help=PERCENT_HELP.get(key),
-                                format="%d" if isinstance(default, int)
-                                else "%.2f" if scale == 1 else "%.1f") / scale
-                for key, label, low, high, default, step, scale in INPUTS
-            ]
+            learned = my_data_toggle()
+            entered, problems = checked_inputs()
             *effects, start_week, promo_weeks = entered
+            intro.caption(f"Plant the true effects, then see whether the estimates follow. "
+                          f"Results average {N_WORLDS} simulated promos of a "
+                          f"{int(effects[-1]):,}-guest chain.")
             start_week, moved = promo_timeline(int(start_week), int(promo_weeks))
             st.caption(" ".join(filter(None, [moved, timeline_text(start_week, int(promo_weeks))])))
-            settings = (*effects, start_week, int(promo_weeks))
+            # Elasticity scales the lifts relative to the discount they were set for
+            reference = learned.discount if learned else REFERENCE_DISCOUNT
+            settings = (*effects, start_week, int(promo_weeks), reference)
 
     if simulated:
-        show_simulation(simulate(st.session_state.first_seed, *settings), *effects[:2])
+        if problems:
+            st.warning("Some sidebar entries are out of range, so these results use the last "
+                       "valid values. See the sidebar.")
+        if learned:
+            st.caption(f"Simulating your business: learned from {st.session_state[KEPT][0]}.")
+        worlds = simulate(st.session_state.first_seed,
+                          as_json(learned.overrides) if learned else "{}", *settings)
+        show_simulation(worlds, *effects[:2])
     elif shown == "Import data":
         show_import()
     else:

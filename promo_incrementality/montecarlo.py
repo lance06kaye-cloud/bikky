@@ -80,7 +80,10 @@ def _one_world(task: tuple) -> tuple:
         **{column: effects.loc["net", column]
            for column in ["ci_low", "ci_high", "wild_ci_low", "wild_ci_high"]},
         "redemptions": money["redemptions"],
-        "subsidized": money["subsidized_redemptions"],
+        # Unclipped: economics() keeps one test's subsidized count between zero and all
+        # redemptions, which near zero cuts off only the low misses and biases the
+        # average upward. Averages across runs need the raw estimate.
+        "subsidized": money["redemptions"] - effects.loc["promo_only", "estimate"],
         "discount_cost": money["total_discount_cost"],
         "cost_per_redemption": money["cost_per_redemption"],
         "cost_per_visit": money["cost_per_incremental_visit"],

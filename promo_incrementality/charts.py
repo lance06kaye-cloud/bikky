@@ -8,22 +8,25 @@ from scipy import optimize, stats
 from promo_incrementality.estimators import EventStudy, weekly_panel
 from promo_incrementality.schema import PromoConfig
 
-TREATED_COLOR = "#2a78d6"
-CONTROL_COLOR = "#eb6834"
-SURFACE = "#fcfcfb"
-TEXT = "#0b0b0b"
-MUTED_TEXT = "#52514e"
-GRID = "#e8e7e3"
-PROMO_WASH = "rgba(42, 120, 214, 0.10)"
-POST_WASH = "rgba(82, 81, 78, 0.07)"
+from promo_incrementality.theme import (
+    ACCENT as TREATED_COLOR,
+    ACCENT_WASH as PROMO_WASH,
+    CONTROL as CONTROL_COLOR,
+    GRID,
+    MUTED_TEXT,
+    NEUTRAL_WASH as POST_WASH,
+    SURFACE,
+    TEXT,
+    TYPE,
+)
 
 
 def _style(fig: go.Figure, title: str, x_title: str, y_title: str | None, x_range: list) -> go.Figure:
     fig.update_layout(
-        title={"text": title, "font": {"size": 16, "color": TEXT}, "x": 0, "xanchor": "left"},
+        title={"text": title, "font": {"size": TYPE["md"], "color": TEXT}, "x": 0, "xanchor": "left"},
         plot_bgcolor=SURFACE,
         paper_bgcolor=SURFACE,
-        font={"color": MUTED_TEXT, "size": 12},
+        font={"color": MUTED_TEXT, "size": TYPE["xs"]},
         hovermode="x unified",
         margin={"l": 60, "r": 110, "t": 100, "b": 50},
         legend={"orientation": "h", "x": 0, "y": 1.02, "yanchor": "bottom"},
@@ -75,7 +78,7 @@ def weekly_means_chart(means: pd.DataFrame, config: PromoConfig) -> go.Figure:
         is_upper = means[column].iloc[-1] >= means[1 - column].iloc[-1]
         fig.add_annotation(x=means.index[-1], y=means[column].iloc[-1], text=name, showarrow=False,
                            xanchor="left", xshift=6, yshift=8 if is_upper else -8,
-                           font={"color": TEXT, "size": 11})
+                           font={"color": TEXT, "size": TYPE["xs"]})
     _shade_promo_windows(fig, config)
     x_range = [means.index[0] - 0.5, means.index[-1] + 0.5]
     return _style(fig, "Weekly visits per location", "Weeks from promo start", "Visits", x_range)

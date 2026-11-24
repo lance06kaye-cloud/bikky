@@ -21,3 +21,9 @@ def dollars_text(value: float) -> str:
         return money_text(value)
     value = round(value, 2)
     return f"{'-' if value < 0 else ''}${abs(value):,.2f}"
+
+
+def visit_cost_text(value: float) -> str:
+    """A cost per net visit, in words when it's undefined: with no net visits there
+    is nothing to divide the cost by, and "n/a" told a reader nothing."""
+    return "No net visits" if pd.isna(value) else dollars_text(value)

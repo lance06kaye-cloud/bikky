@@ -1,5 +1,6 @@
 """Bring outside data into the common schema, with errors a person can act on."""
 
+import dataclasses
 import re
 import warnings
 from pathlib import Path
@@ -56,15 +57,23 @@ def _as_text(values: pd.Series) -> pd.Series:
 
 
 class DataError(ValueError):
-    """Input data can't be analyzed. `problems` lists every reason found."""
+    """Input data can't be analyzed. `problems` lists every reason found.
 
-    def __init__(self, problems: list):
-        super().__init__("\n".join(problems))
-        self.problems = problems
+    The reasons come in two kinds, so a page can head them differently:
+    `setting_problems` are about the promo settings a person typed in (dates, margin,
+    codes), and `file_problems` are about the data itself. `problems` holds both,
+    settings first.
+    """
+
+    def __init__(self, problems: list = (), setting_problems: list = ()):
+        self.file_problems = list(problems)
+        self.setting_problems = list(setting_problems)
+        self.problems = self.setting_problems + self.file_problems
+        super().__init__("\n".join(self.problems))
 
     def __reduce__(self):
-        # Rebuilt from the list, not the joined message, when it crosses processes
-        return DataError, (self.problems,)
+        # Rebuilt from the lists, not the joined message, when it crosses processes
+        return DataError, (self.file_problems, self.setting_problems)
 
 
 def _choose_format(text: pd.Series) -> str | None:
@@ -343,12 +352,76 @@ def read_config(source) -> tuple:
     return config, options
 
 
+MARGIN_LABEL = "Average profit per order"
+POST_WEEKS_LABEL = "Weeks to watch after the promo"
+CODES_LABEL = "Promo codes"
+
+
+def _day(day) -> str:
+    return f"{pd.Timestamp(day):%Y-%m-%d}"
+
+
+def _codes_text(codes) -> str:
+    return ", ".join(map(str, codes))
+
+
+def check_settings(promo_start, promo_end, avg_margin_per_order, post_window_weeks) -> dict:
+    """Problems with the promo settings alone, before any data is read, keyed by
+    read_upload's argument name. The words name the fields on the Import page."""
+    problems = {}
+    if promo_start is not None and promo_end is not None and \
+            pd.Timestamp(promo_end).normalize() < pd.Timestamp(promo_start).normalize():
+        problems["promo_end"] = "The promo's last day is before its first day."
+    try:
+        margin = float(avg_margin_per_order)
+    except (TypeError, ValueError):
+        margin = np.nan
+    if not np.isfinite(margin) or margin <= 0:
+        problems["avg_margin_per_order"] = f"{MARGIN_LABEL} must be above $0."
+    if post_window_weeks is None or int(post_window_weeks) < 1:
+        problems["post_window_weeks"] = (f"{POST_WEEKS_LABEL} must be at least 1, so "
+                                         "pull-forward and lasting effects can be measured.")
+    return problems
+
+
+def _no_redemptions(transactions: pd.DataFrame, config: PromoConfig) -> tuple:
+    """Why the promo found no redemptions, as (file problems, setting problems)."""
+    if config.promo_codes:
+        codes = _codes_text(config.promo_codes)
+        if transactions["promo_code"].isna().all():
+            return [], [
+                f"You entered promo codes ({codes}), but the file has no promo_code column "
+                f"to match them against. Leave {CODES_LABEL} blank to count every discounted "
+                "order, or add a promo_code column to the file."
+            ]
+        if not promo_redemptions(transactions, dataclasses.replace(config, promo_codes=None)).empty:
+            return [], [
+                f"No orders used the promo code(s) you entered ({codes}) at promo stores "
+                "during the promo. Check the codes, or leave the field blank to count every "
+                "discounted order at promo stores during the promo."
+            ]
+    promo_stores = transactions["location_id"].isin(config.treated_location_ids)
+    discounted = transactions.loc[promo_stores & (transactions["discount_amount"] > 0), "timestamp"]
+    if discounted.empty:
+        return [
+            "No order at a promo store has a discount_amount above 0, so there are no "
+            "redemptions to count. Fill in discount_amount for the orders that used the promo."
+        ], []
+    return [], [
+        f"No orders at promo stores had a discount between the promo's first day "
+        f"({_day(config.promo_start)}) and last day ({_day(config.promo_end)}). Promo stores' "
+        f"discounted orders run from {_day(discounted.min())} to {_day(discounted.max())}, "
+        "so check the promo dates."
+    ]
+
+
 def check_inputs(transactions: pd.DataFrame, config: PromoConfig) -> pd.DataFrame:
     """Raise DataError if this data can't support an analysis of this promo.
 
-    Returns the promo's redemptions, which the check has to find anyway.
+    Returns the promo's redemptions, which the check has to find anyway. Problems the
+    promo settings could fix are kept apart from problems in the file.
     """
-    problems = []
+    problems, settings = [], []
     locations = set(transactions["location_id"])
     treated = set(config.treated_location_ids)
 
@@ -357,61 +430,83 @@ def check_inputs(transactions: pd.DataFrame, config: PromoConfig) -> pd.DataFram
     elif treated - locations:
         problems.append(f"Treated locations not in the data: {sorted(treated - locations)}")
     if not locations - treated:
-        problems.append("Every location is treated, so there is no control group.")
+        problems.append("Every store ran the promo, so there's no control group to compare "
+                        "against. Include stores that didn't run it.")
     if len(locations) < 3:
-        problems.append("At least 3 locations are needed.")
+        problems.append(f"At least 3 stores are needed, and the data has {len(locations)}.")
     if config.location_market and locations - set(config.location_market):
         missing = sorted(locations - set(config.location_market))
         problems.append(f"Locations missing from the market map: {missing}")
-    if not np.isfinite(config.avg_margin_per_order) or config.avg_margin_per_order <= 0:
-        problems.append("avg_margin_per_order must be above zero.")
-    if config.post_window_weeks < 1:
-        problems.append(
-            "post_window_weeks must be at least 1, so pull-forward and halo can be measured."
-        )
+    settings += check_settings(None, None, config.avg_margin_per_order,
+                               config.post_window_weeks).values()
 
+    data_start = transactions["timestamp"].min().normalize()
+    data_end = transactions["timestamp"].max().normalize()
     needed = max(MIN_PRE_WEEKS, config.promo_weeks)
     first_day = transactions.groupby("location_id")["timestamp"].min().dt.normalize()
     history_weeks = (config.promo_start - first_day).dt.days // 7
+    short = sorted(history_weeks[history_weeks < needed].index)
+    if config.promo_start > data_end or config.promo_end < data_start:
+        settings.append(
+            f"The promo dates ({_day(config.promo_start)} to {_day(config.promo_end)}) are "
+            f"outside the file, which runs from {_day(data_start)} to {_day(data_end)}."
+        )
+        short = []
+    elif short and len(short) == len(history_weeks):
+        earliest = first_day.min() + pd.Timedelta(weeks=needed)
+        settings.append(
+            f"The analysis needs {needed} full weeks of orders before the promo's first day, "
+            f"and the file starts {_day(data_start)}. Set the promo's first day to "
+            f"{_day(earliest)} or later, or add earlier orders to the file."
+        )
+        short = []
     before = transactions[transactions["timestamp"] < config.promo_start]
     week = (before["timestamp"].dt.normalize() - config.promo_start).dt.days // 7
     active_weeks = week.groupby(before["location_id"]).nunique().reindex(history_weeks.index, fill_value=0)
     sparse = sorted(set(active_weeks[active_weeks < needed].index) - set(history_weeks[history_weeks < needed].index))
     if sparse:
         problems.append(
-            f"Locations with visits in fewer than {needed} weeks before the promo: {sparse}. "
-            "A stray early order doesn't make a baseline; remove them."
+            f"Stores with visits in fewer than {needed} weeks before the promo: {sparse}. "
+            "A stray early order doesn't make a baseline; remove them from the file."
         )
-    short = sorted(history_weeks[history_weeks < needed].index)
     if short:
         problems.append(
-            f"Locations with fewer than {needed} full weeks of data before the promo: "
-            f"{short}. Remove them, or analyze a later promo."
+            f"Stores with fewer than {needed} full weeks of orders before the promo: "
+            f"{short}. Remove them from the file, or analyze a later promo."
         )
 
     last_needed = config.last_day_needed
-    if transactions["timestamp"].max().normalize() < last_needed:
-        problems.append(
-            f"Data ends {transactions['timestamp'].max():%Y-%m-%d}, before the post window "
-            f"ends {last_needed:%Y-%m-%d}. Shorten post_window_weeks or add data."
+    if settings and config.promo_start > data_end:
+        pass  # Already reported: the promo is past the end of the file
+    elif data_end < config.promo_end:
+        settings.append(
+            f"The file's orders end {_day(data_end)}, before the promo's last day "
+            f"({_day(config.promo_end)}). Check the promo dates, or add later orders to the file."
+        )
+    elif data_end < last_needed:
+        # Whole weeks between the promo's start and the file's end, less the promo's own
+        fits = ((data_end - config.promo_start).days + 1) // 7 - config.promo_weeks
+        fix = (f"Set {POST_WEEKS_LABEL} to {fits} or fewer, or add later orders to the file."
+               if fits >= 1 else
+               "Add at least a week of orders after the promo to the file.")
+        settings.append(
+            f"The file's orders end {_day(data_end)}, but watching {config.post_window_weeks} "
+            f"weeks after the promo runs to {_day(last_needed)}. {fix}"
         )
     else:
         last_day = transactions.groupby("location_id")["timestamp"].max().dt.normalize()
         closed = sorted(last_day[last_day < last_needed - pd.Timedelta(days=6)].index)
         if closed:
             problems.append(
-                f"Locations with no visits in the last week of the post window: {closed}. "
-                "If they closed, remove them."
+                f"Stores with no orders in the last week you're watching after the promo "
+                f"(to {_day(last_needed)}): {closed}. If they closed, remove them from the file."
             )
 
     redeemed = promo_redemptions(transactions, config)
-    if not problems and redeemed.empty:
-        problems.append(
-            "No discounted orders at promo locations during the promo. Check the discount "
-            "column mapping and promo_codes."
-        )
-    if problems:
-        raise DataError(problems)
+    if not problems and not settings and redeemed.empty:
+        problems, settings = _no_redemptions(transactions, config)
+    if problems or settings:
+        raise DataError(problems, settings)
     return redeemed
 
 
@@ -446,8 +541,31 @@ def read_upload(
     """Read the one-file upload. Returns (transactions, PromoConfig).
 
     Columns use the names in UPLOAD_COLUMNS. `got_promo` (yes/no) marks the stores
-    that ran the promo, and `market`, if given, groups stores into markets.
+    that ran the promo, and `market`, if given, groups stores into markets. Problems
+    with the settings are reported alongside any problems found in the file.
     """
+    settings = list(check_settings(promo_start, promo_end, avg_margin_per_order,
+                                   post_window_weeks).values())
+    try:
+        transactions, treated, location_market = _read_upload_file(source)
+    except DataError as error:
+        raise DataError(error.file_problems, settings + error.setting_problems) from error
+    if settings:
+        raise DataError([], settings)
+    config = PromoConfig(
+        promo_start=pd.Timestamp(promo_start),
+        promo_end=pd.Timestamp(promo_end),
+        treated_location_ids=treated,
+        post_window_weeks=int(post_window_weeks),
+        avg_margin_per_order=float(avg_margin_per_order),
+        location_market=location_market,
+        promo_codes=list(promo_codes) if promo_codes else None,
+    )
+    return transactions, config
+
+
+def _read_upload_file(source) -> tuple:
+    """The upload's (transactions, promo stores, market map), or DataError for the file."""
     text_columns = {column: str for column in ["location_id", "market", "got_promo",
                                                 "promo_code", "guest_id"]}
     try:
@@ -509,19 +627,7 @@ def read_upload(
     if not treated:
         raise DataError(["No store has got_promo = yes, so there's no promo to measure."])
 
-    try:
-        config = PromoConfig(
-            promo_start=pd.Timestamp(promo_start),
-            promo_end=pd.Timestamp(promo_end),
-            treated_location_ids=treated,
-            post_window_weeks=int(post_window_weeks),
-            avg_margin_per_order=float(avg_margin_per_order),
-            location_market=location_market,
-            promo_codes=list(promo_codes) if promo_codes else None,
-        )
-    except ValueError as error:
-        raise DataError([f"Check the promo settings: {error}."]) from error
-    return transactions, config
+    return transactions, treated, location_market
 
 
 def to_upload(transactions: pd.DataFrame, config: PromoConfig) -> pd.DataFrame:
